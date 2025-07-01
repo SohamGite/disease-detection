@@ -1,0 +1,518 @@
+from fastapi import FastAPI, Request, HTTPException, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+import os
+import joblib
+import json
+import pandas as pd
+import sqlite3
+from pydantic import BaseModel
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict
+import google.generativeai as genai
+import jwt
+from passlib.context import CryptContext
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = FastAPI()
+
+# CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# JWT configuration
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# OAuth2 scheme
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+# Global chat session storage (user_id -> {prompt: chat_session})
+chat_sessions: Dict[str, Dict[str, Dict[str, genai.ChatSession]]] = {}
+
+# SQLite database setup
+def init_db():
+    conn = sqlite3.connect("ayurvaid.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            hashed_password TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            conversation_id TEXT NOT NULL,
+            sender TEXT NOT NULL,
+            message TEXT NOT NULL,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pending_chats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            conversation_id TEXT NOT NULL,
+            symptoms TEXT,
+            age TEXT,
+            gender TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# Pydantic models
+class InputData(BaseModel):
+    user_input: str
+    conversation_id: Optional[str] = None  # Allow optional conversation_id
+
+class UserCreate(BaseModel):
+    username: str
+    email: str
+    password: str
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+class ChatMessage(BaseModel):
+    sender: str
+    message: str
+    timestamp: str
+
+# Utility functions
+def loadDataFromJson():
+    try:
+        with open("data.json", "r") as f:
+            loaded_data = json.load(f)
+        return (
+            loaded_data["systemPrompt"],
+            loaded_data["symptom_master_list"],
+            loaded_data["ayurvedicHash"],
+            loaded_data["ayurvedicSystemPrompt"],
+            loaded_data.get("aryuvedicMedicineData", {}),
+            loaded_data["finalResponseSystemPrompt"],
+            loaded_data.get("conversationalPrompt", "Respond conversationally..."),
+            loaded_data.get("intentPrompt", "Classify the input..."),
+            loaded_data.get("adjustmentPrompt", "Given a disease...")
+        )
+    except Exception as e:
+        raise ValueError(f"Failed to load data.json: {str(e)}")
+
+def setupGemini(systemPrompt: str, user_id: str, conversation_id: str):
+    genai_api_key = os.getenv("GENAI_APIKEY")
+    genai_model = os.getenv("GENAI_MODEL")
+    if not genai_api_key or not genai_model:
+        raise ValueError("Please set GENAI_APIKEY and GENAI_MODEL environment variables.")
+    
+    genai.configure(api_key=genai_api_key)
+    if user_id not in chat_sessions:
+        chat_sessions[user_id] = {}
+    if conversation_id not in chat_sessions[user_id]:
+        chat_sessions[user_id][conversation_id] = {}
+    if systemPrompt not in chat_sessions[user_id][conversation_id]:
+        model = genai.GenerativeModel(model_name=genai_model, system_instruction=systemPrompt)
+        chat_sessions[user_id][conversation_id][systemPrompt] = model.start_chat()
+    return chat_sessions[user_id][conversation_id][systemPrompt]
+
+def askGemini(prompt: str, geminiChat):
+    try:
+        response = geminiChat.send_message(prompt)
+        raw_text = response.text.strip()
+        clean_text = raw_text.replace("```json", "").replace("```", "").strip()
+        if not clean_text:
+            raise ValueError("Empty response from Gemini")
+        return clean_text
+    except Exception as e:
+        print(f"Gemini API error: {str(e)}")
+        return '{"symptoms": [], "age": null, "gender": null}'  # Fallback JSON
+
+def convertUserResponseToDatasetStructure(input_symptoms, symptom_master_list):
+    if isinstance(input_symptoms, str):
+        cleaned_input = input_symptoms.replace("```json", "").replace("```", "").strip()
+        try:
+            input_symptoms = json.loads(cleaned_input)
+        except json.JSONDecodeError:
+            input_symptoms = [s.strip() for s in cleaned_input.split(",") if s.strip()]
+    elif not isinstance(input_symptoms, list):
+        input_symptoms = [str(input_symptoms)]
+
+    input_symptoms = [s.lower().strip() for s in input_symptoms]
+    symptom_master_list = [s.lower().strip() for s in symptom_master_list]
+    binary_vector = [1 if symptom in input_symptoms else 0 for symptom in symptom_master_list]
+    return binary_vector
+
+def predict_disease(input_list, model_path='disease_lr_model_with_encoder.joblib'):
+    try:
+        bundle = joblib.load(model_path)
+        model = bundle['model']
+        encoder = bundle['label_encoder']
+        input_df = pd.DataFrame([input_list], columns=model.estimators_[0].feature_names_in_)
+        if sum(input_list) == 0:
+            return "No disease predicted (no symptoms matched)"
+        pred_encoded = model.predict(input_df)
+        prediction = encoder.inverse_transform(pred_encoded)[0]
+        print(f"Model prediction: {prediction}")
+        return prediction
+    except Exception as e:
+        raise ValueError(f"Prediction error: {str(e)}")
+
+def classifyDisease(disease: str, symptoms, geminiChat):
+    userPrompt = f"Diseases: {disease}\nSymptoms: {', '.join(symptoms)}"
+    return askGemini(userPrompt, geminiChat).strip()
+
+def getKeyValuesfromMedicineJson(jsonData, key: str):
+    return jsonData.get(key, [])
+
+def listCleaner(response):
+    if not isinstance(response, list):
+        cleaned = response.replace("`", "").replace("json", "").strip()
+        try:
+            return json.loads(cleaned) if cleaned.startswith("[") else cleaned.split(",")
+        except:
+            return [cleaned]
+    return response
+
+def save_pending_chat(user_id: str, conversation_id: str, symptoms: list, age: str = None, gender: str = None):
+    conn = sqlite3.connect("ayurvaid.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO pending_chats (user_id, conversation_id, symptoms, age, gender) VALUES (?, ?, ?, ?, ?)",
+        (user_id, conversation_id, json.dumps(symptoms) if symptoms else None, age, gender)
+    )
+    conn.commit()
+    conn.close()
+
+# Update get_pending_chat to include conversation_id
+def get_pending_chat(user_id: str, conversation_id: str):
+    conn = sqlite3.connect("ayurvaid.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT symptoms, age, gender FROM pending_chats WHERE user_id = ? AND conversation_id = ? ORDER BY created_at DESC LIMIT 1",
+        (user_id, conversation_id)
+    )
+    result = cursor.fetchone()
+    if result:
+        cursor.execute("DELETE FROM pending_chats WHERE user_id = ? AND conversation_id = ?", (user_id, conversation_id))
+        conn.commit()
+    conn.close()
+    symptoms = json.loads(result[0]) if result and result[0] else []
+    return {"symptoms": symptoms, "age": result[1] if result else None, "gender": result[2] if result else None}
+
+# Authentication utilities
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    conn = sqlite3.connect("ayurvaid.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, username, email FROM users WHERE username = ?", (username,))
+    user = cursor.fetchone()
+    conn.close()
+    
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    return {"id": user[0], "username": user[1], "email": user[2]}
+
+# Static content endpoints
+@app.get("/about")
+def get_about():
+    return {
+        "title": "About Ayurvaid",
+        "purpose": "Ayurvaid is an innovative health companion that blends ancient Ayurvedic wisdom with cutting-edge artificial intelligence to provide personalized wellness insights. Our mission is to empower users with accessible health guidance rooted in holistic traditions while leveraging modern technology.",
+        "dataset": [
+            "A symptom master list containing over 377 common health symptoms and indicators.",
+            "A curated dataset of Ayurvedic diseases and remedies, sourced from traditional texts and validated by experts.",
+            "Machine learning models trained on anonymized medical data for disease prediction.",
+        ],
+        "workflow": [
+            "Users input symptoms, age, and gender through a conversational interface.",
+            "The AI analyzes symptoms using a pre-trained machine learning model to predict potential diseases.",
+            "Gemini AI processes the input to provide conversational responses and maps diseases to Ayurvedic remedies.",
+            "Results are presented with suggested treatments, adjusted for individual context.",
+        ],
+        "disclaimer": "This application is for informational purposes only and is not a substitute for professional medical advice. Always consult a qualified doctor or health practitioner before making health decisions or relying on the suggestions provided by Ayurvaid. The information here should not be used to diagnose or treat any medical condition without professional guidance."
+    }
+
+
+@app.get("/services")
+def get_services():
+    return {
+        "title": "Our Services",
+        "description": "Ayurvaid offers a range of AI-powered health services designed to integrate Ayurvedic wisdom with modern technology, providing personalized wellness solutions.",
+        "services": [
+            {
+                "name": "Symptom Analysis",
+                "description": "Leverage AI to analyze your symptoms and predict potential health conditions with high accuracy.",
+                "details": [
+                    "Input symptoms, age, and gender for tailored analysis.",
+                    "Utilizes a machine learning model trained on medical data.",
+                    "Provides initial disease predictions for user awareness.",
+                ],
+                "note": "Results are preliminary and should be validated by a professional."
+            },
+            {
+                "name": "Ayurvedic Remedies",
+                "description": "Discover natural treatments based on ancient Ayurvedic practices, customized to your health profile.",
+                "details": [
+                    "Maps predicted diseases to Ayurvedic diagnoses.",
+                    "Suggests remedies from a curated database of herbal medicines.",
+                    "Integrates Gemini AI for contextual advice.",
+                ],
+                "note": "Remedies are suggestions; consult an Ayurvedic practitioner."
+            },
+            {
+                "name": "Health Guidance",
+                "description": "Receive daily tips and lifestyle advice to enhance your well-being through Ayurvedic principles.",
+                "details": [
+                    "Offers diet and exercise recommendations.",
+                    "Provides seasonal wellness tips based on Ayurvedic doshas.",
+                    "Supports long-term health monitoring.",
+                ],
+                "note": "Guidance is general and not a replacement for medical advice."
+            }
+        ]
+    }
+
+@app.get("/contact")
+def get_contact():
+    return {
+        "title": "Contact Us",
+        "introduction": "We’re here to assist you on your wellness journey. Reach out to the Ayurvaid team for support, inquiries, or feedback about our services.",
+        "email": "support@ayurvaid.com",
+        "phone": "+91-123-456-7890",
+        "address": "123 Wellness Lane, Ayur City, India",
+        "supportHours": "Monday to Friday, 9:00 AM - 6:00 PM IST",
+        "socialMedia": [
+            {"name": "Twitter", "link": "https://twitter.com/ayurvaid"},
+            {"name": "Facebook", "link": "https://facebook.com/ayurvaid"},
+        ]
+    }
+# Authentication endpoints
+@app.post("/signup")
+def signup(user: UserCreate):
+    conn = sqlite3.connect("ayurvaid.db")
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT id FROM users WHERE username = ? OR email = ?", (user.username, user.email))
+    if cursor.fetchone():
+        conn.close()
+        raise HTTPException(status_code=400, detail="Username or email already exists")
+    
+    hashed_password = get_password_hash(user.password)
+    try:
+        cursor.execute(
+            "INSERT INTO users (username, email, hashed_password) VALUES (?, ?, ?)",
+            (user.username, user.email, hashed_password)
+        )
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=500, detail=f"Error creating user: {str(e)}")
+    
+    conn.close()
+    return {"message": "User created successfully"}
+
+@app.post("/login")
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    conn = sqlite3.connect("ayurvaid.db")
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT id, username, hashed_password FROM users WHERE username = ?", (form_data.username,))
+    user = cursor.fetchone()
+    conn.close()
+    
+    if not user or not verify_password(form_data.password, user[2]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    
+    access_token = create_access_token(data={"sub": user[1]})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# Updated predict endpoint
+@app.post("/predict")
+async def predict(data: InputData, current_user: dict = Depends(get_current_user)):
+    user_id = current_user["id"]
+    conversation_id = data.conversation_id if hasattr(data, "conversation_id") else datetime.now().strftime("%Y%m%d%H%M%S")
+
+    try:
+        systemPrompt, symptom_master_list, ayurvedicHash, ayurvedicSystemPrompt, aryuvedicMedicineData, finalResponseSystemPrompt, conversationalPrompt, intentPrompt, adjustmentPrompt = loadDataFromJson()
+    except Exception as e:
+        return {"error": f"Error loading data: {str(e)}"}
+
+    # Initialize or reuse chat sessions with conversation_id
+    geminiIntentChat = setupGemini(intentPrompt, user_id, conversation_id)
+    geminiConversationalChat = setupGemini(conversationalPrompt, user_id, conversation_id)
+    geminiDiseaseChat = setupGemini(systemPrompt, user_id, conversation_id)
+    geminiAryuvedicChat = setupGemini(ayurvedicSystemPrompt, user_id, conversation_id)
+    geminiFinalResponseChat = setupGemini(finalResponseSystemPrompt, user_id, conversation_id)
+    geminiAdjustmentChat = setupGemini(adjustmentPrompt, user_id, conversation_id)
+
+    # Load chat history for context within this conversation
+    conn = sqlite3.connect("ayurvaid.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT message FROM chats WHERE user_id = ? AND conversation_id = ? ORDER BY timestamp DESC LIMIT 5",
+        (user_id, conversation_id)
+    )
+    chat_history = [row[0] for row in cursor.fetchall()]
+    conn.close()
+
+    context_prompt = "\n".join(chat_history) + "\nUser: " + data.user_input if chat_history else data.user_input
+
+    # Save user message with conversation_id
+    conn = sqlite3.connect("ayurvaid.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO chats (user_id, conversation_id, sender, message) VALUES (?, ?, ?, ?)",
+        (user_id, conversation_id, "user", data.user_input)
+    )
+    conn.commit()
+    conn.close()
+
+    try:
+        intent = askGemini(context_prompt, geminiIntentChat).strip().lower()
+        print(f"User input: {data.user_input}")
+        print(f"Detected intent: {intent}")
+
+        if intent == "general":
+            finalResponse = askGemini(context_prompt, geminiConversationalChat)
+            print(f"Conversational response: {finalResponse}")
+        else:
+            raw_response = askGemini(context_prompt, geminiDiseaseChat)
+            print(f"Raw Gemini response: {raw_response}")
+            try:
+                parsed_data = json.loads(raw_response)
+                if not isinstance(parsed_data, dict):
+                    raise ValueError("Invalid JSON structure")
+                print(f"Parsed data: {parsed_data}")
+            except (json.JSONDecodeError, ValueError) as e:
+                print(f"JSON parsing error: {str(e)}")
+                finalResponse = "I couldn’t process that input. Could you describe your symptoms, age, and gender? (e.g., 'I’m 30 male with fever')"
+                parsed_data = {"symptoms": [], "age": None, "gender": None}
+
+            symptoms = parsed_data.get("symptoms", [])
+            age = parsed_data.get("age")
+            gender = parsed_data.get("gender")
+
+            if symptoms or age or gender:
+                save_pending_chat(user_id, conversation_id, symptoms, age, gender)
+
+            pending_data = get_pending_chat(user_id, conversation_id)
+            symptoms = pending_data["symptoms"]
+            age = pending_data["age"]
+            gender = pending_data["gender"]
+
+            if not symptoms or all(s.strip() == "" for s in symptoms):
+                finalResponse = "I couldn’t identify symptoms. Please describe your health concerns."
+            elif not (age and gender):
+                save_pending_chat(user_id, conversation_id, symptoms, age, gender)
+                finalResponse = "Please provide your age and gender for this context (e.g., 'I’m 30 male')."
+            else:
+                binary_vector = convertUserResponseToDatasetStructure(symptoms, symptom_master_list)
+                print(f"Symptoms binary vector: {binary_vector}")
+                if sum(binary_vector) == 0:
+                    finalResponse = "I couldn’t match those symptoms. Please describe them differently."
+                else:
+                    diseasesPredicted = predict_disease(binary_vector)
+                    raw_adjust_response = askGemini(
+                        f"Disease: {diseasesPredicted}, Symptoms: {', '.join(symptoms)}, Age: {age}, Gender: {gender}",
+                        geminiAdjustmentChat
+                    )
+                    print(f"Raw adjustment response: {raw_adjust_response}")
+                    try:
+                        adjustments = json.loads(raw_adjust_response)
+                    except json.JSONDecodeError:
+                        adjustments = {"disease_adjustment": "None", "medicine_adjustment": "None"}
+                    ayurvedicRog = classifyDisease(diseasesPredicted, symptoms, geminiAryuvedicChat).strip()
+                    listOfAyurvedicMedication = getKeyValuesfromMedicineJson(aryuvedicMedicineData, ayurvedicRog)
+                    if not isinstance(listOfAyurvedicMedication, list):
+                        listOfAyurvedicMedication = listCleaner(listOfAyurvedicMedication)
+
+                    userMedicalData = (
+                        f"Disease Name: {diseasesPredicted}\n"
+                        f"Symptoms: {', '.join(symptoms)}\n"
+                        f"Age: {age or 'Not provided'}\n"
+                        f"Gender: {gender or 'Not provided'}\n"
+                        f"Disease Adjustment: {adjustments.get('disease_adjustment', 'None')}\n"
+                        f"Medicine Adjustment: {adjustments.get('medicine_adjustment', 'None')}\n"
+                        f"Aurvedic Disease Name: {ayurvedicRog}\n"
+                        f"Aurvedic Medications List: {listOfAyurvedicMedication}"
+                    )
+                    finalResponse = askGemini(userMedicalData, geminiFinalResponseChat)
+
+        conn = sqlite3.connect("ayurvaid.db")
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO chats (user_id, conversation_id, sender, message) VALUES (?, ?, ?, ?)",
+            (user_id, conversation_id, "bot", finalResponse)
+        )
+        conn.commit()
+        conn.close()
+
+        return {"response": finalResponse}
+
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
+        return {"error": f"Error processing request: {str(e)}"}
+    
+# Update chats endpoint to support conversation_id filtering
+@app.get("/chats")
+async def get_chat_history(
+    current_user: dict = Depends(get_current_user),
+    conversation_id: Optional[str] = None
+):
+    conn = sqlite3.connect("ayurvaid.db")
+    cursor = conn.cursor()
+    query = "SELECT sender, message, timestamp FROM chats WHERE user_id = ?"
+    params = [current_user["id"]]
+    if conversation_id:
+        query += " AND conversation_id = ?"
+        params.append(conversation_id)
+    query += " ORDER BY timestamp ASC"
+    cursor.execute(query, params)
+    chats = cursor.fetchall()
+    conn.close()
+    
+    return [
+        {"sender": chat[0], "message": chat[1], "timestamp": chat[2]}
+        for chat in chats
+    ]

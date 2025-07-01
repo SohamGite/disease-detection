@@ -1,0 +1,103 @@
+# Python/FastAPI Backend
+# Virtual environments
+venv/
+.env
+env/
+*.venv/
+
+# Python compiled files
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+
+# Local database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Sensitive data files
+data.json
+*.txt  # Excluding all .txt files (assumed temporary or sensitive; clarify if specific files needed)
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Environment variables
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Dependency directories
+.pip/
+.pipenv/
+
+# FastAPI-specific
+uvicorn.log
+
+# React Frontend
+# Node modules
+node_modules/
+
+# Build outputs
+build/
+dist/
+.out/
+
+# Environment variables
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+# Parcel/Vite cache
+.cache/
+.parcel-cache/
+
+# Testing coverage
+coverage/
+
+# Yarn files
+.yarn/
+.yarnrc
+yarn.lock  # Include if using npm; exclude if using Yarn exclusively
+
+# npm debug
+npm-debug.log
+yarn-error.log
+
+# General
+# IDE and editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.bak
+*.swp
+*~
+*.tmp
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+coverage.xml
+*.cover
+*.py,cover
+
+# Package manager lock files (optional, include if using npm)
+package-lock.json  # Include if using npm; exclude if using Yarn
+
+# Miscellaneous
+*.pid
+*.seed
+*.pid.lock

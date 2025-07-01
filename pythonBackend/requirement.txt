@@ -1,0 +1,10 @@
+fastapi[all]
+pyjwt
+cryptography
+passlib[bcrypt]
+python-jose[cryptography]
+python-dotenv
+pandas
+joblib
+google-generativeai
+uvicorn

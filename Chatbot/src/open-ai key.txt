@@ -1,0 +1,13 @@
+future modifications:
+1   ⭐Trivial mode and dedicated mode
+
+2   ⭐adding database to store chats
+
+3   ⭐login/sign up
+
+4   ⭐payment for better model (both LLM and ML model)
+
+5   ⭐landing page about us navbar footer (ui and backend)
+
+6   ⭐reply in voice like ai assistant charak.ai
+
