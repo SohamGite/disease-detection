@@ -85,7 +85,8 @@ const Services = () => {
               className="bg-white/90 p-6 rounded-lg shadow-md hover:shadow-xl transition-all duration-300 text-gray-800"
             >
               <img
-                src="https://images.unsplash.com/photo-1600585154340-be6161a56a0c?ixlib=rb-4.0.3&auto=format&fit=crop&w=300&q=80"
+                src={`${service.image}`}
+                // src="https://images.unsplash.com/photo-1600585154340-be6161a56a0c?ixlib=rb-4.0.3&auto=format&fit=crop&w=300&q=80"
                 alt={`${service.name} Icon`}
                 className="w-full h-40 object-cover rounded-t-lg mb-4"
               />

@@ -80,9 +80,9 @@ const Contact = () => {
         </div>
         <div className="bg-white/90 p-6 rounded-lg shadow-md w-full max-w-2xl text-gray-800">
           <img
-            src="https://images.unsplash.com/photo-1600585154340-be6161a56a0c?ixlib=rb-4.0.3&auto=format&fit=crop&w=300&q=80"
+            src="https://media.post.rvohealth.io/wp-content/uploads/2024/02/Ayurvedic-header.jpg"
             alt="Contact Us"
-            className="w-full h-40 object-cover rounded-t-lg mb-4"
+            className="w-full h-70 object-cover rounded-t-lg mb-4"
           />
           <p className="text-lg mb-4">
             <strong className="text-gray-700">Email:</strong>{" "}

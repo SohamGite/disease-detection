@@ -35,7 +35,7 @@ const Home = () => {
           {/* Welcome Section */}
           <div className="bg-white/90 p-6 rounded-lg shadow-md hover:shadow-xl transition-all duration-300 text-gray-800">
             <img
-              src="https://images.unsplash.com/photo-1600585154340-be6161a56a0c?ixlib=rb-4.0.3&auto=format&fit=crop&w=300&q=80" // Placeholder: Ayurveda symbol
+              src="https://tse2.mm.bing.net/th/id/OIP.MM0vcg2oubk2RabFf3FcYAHaEi?r=0&rs=1&pid=ImgDetMain&o=7&rm=3" // Placeholder: Ayurveda symbol
               alt="Ayurvedic Wellness"
               className="w-full h-40 object-cover rounded-t-lg mb-4"
             />
@@ -51,7 +51,7 @@ const Home = () => {
           {/* Features Section */}
           <div className="bg-white/90 p-6 rounded-lg shadow-md hover:shadow-xl transition-all duration-300 text-gray-800">
             <img
-              src="https://images.unsplash.com/photo-1451187580459-43490279c0fa?ixlib=rb-4.0.3&auto=format&fit=crop&w=300&q=80" // Placeholder: AI technology
+              src="https://tse3.mm.bing.net/th/id/OIP.RQ2-RI8faNi0dBMRNB0HoAHaD3?r=0&rs=1&pid=ImgDetMain&o=7&rm=3" // Placeholder: AI technology
               alt="AI Integration"
               className="w-full h-40 object-cover rounded-t-lg mb-4"
             />

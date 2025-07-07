@@ -81,7 +81,7 @@ const About = () => {
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8 w-full px-4">
           <div className="bg-white/90 p-6 rounded-lg shadow-md hover:shadow-xl transition-all duration-300 text-gray-800">
             <img
-              src="https://images.unsplash.com/photo-1600585154340-be6161a56a0c?ixlib=rb-4.0.3&auto=format&fit=crop&w=300&q=80"
+              src="https://media.post.rvohealth.io/wp-content/uploads/2024/02/Ayurvedic-header.jpg"
               alt="Ayurvedic Dataset"
               className="w-full h-40 object-cover rounded-t-lg mb-4"
             />
@@ -94,7 +94,7 @@ const About = () => {
           </div>
           <div className="bg-white/90 p-6 rounded-lg shadow-md hover:shadow-xl transition-all duration-300 text-gray-800">
             <img
-              src="https://images.unsplash.com/photo-1451187580459-43490279c0fa?ixlib=rb-4.0.3&auto=format&fit=crop&w=300&q=80"
+              src="https://tse3.mm.bing.net/th/id/OIP.RQ2-RI8faNi0dBMRNB0HoAHaD3?r=0&rs=1&pid=ImgDetMain&o=7&rm=3"
               alt="AI Workflow"
               className="w-full h-40 object-cover rounded-t-lg mb-4"
             />
@@ -107,7 +107,8 @@ const About = () => {
           </div>
           <div className="bg-white/90 p-6 rounded-lg shadow-md hover:shadow-xl transition-all duration-300 text-gray-800">
             <img
-              src="https://images.unsplash.com/photo-1576091160399-112ba8d25d1d?ixlib=rb-4.0.3&auto=format&fit=crop&w=300&q=80"
+              src="https://tse2.mm.bing.net/th/id/OIP.MM0vcg2oubk2RabFf3FcYAHaEi?r=0&rs=1&pid=ImgDetMain&o=7&rm=3"
+              // src="https://images.unsplash.com/photo-1576091160399-112ba8d25d1d?ixlib=rb-4.0.3&auto=format&fit=crop&w=300&q=80"
               alt="Disclaimer"
               className="w-full h-40 object-cover rounded-t-lg mb-4"
             />

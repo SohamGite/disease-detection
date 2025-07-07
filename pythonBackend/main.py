@@ -373,16 +373,19 @@ def get_services():
         "services": [
             {
                 "name": "Symptom Analysis",
+                "image":"https://tse2.mm.bing.net/th/id/OIP.MM0vcg2oubk2RabFf3FcYAHaEi?r=0&rs=1&pid=ImgDetMain&o=7&rm=3",
                 "description": "Analyze symptoms to predict health conditions.",
                 "details": ["Input symptoms, age, gender, and previous conditions.", "Uses ML models."]
             },
             {
                 "name": "Ayurvedic Remedies",
+                "image":"https://media.post.rvohealth.io/wp-content/uploads/2024/02/Ayurvedic-header.jpg",
                 "description": "Discover natural treatments customized to your profile.",
                 "details": ["Maps diseases to Ayurvedic remedies."]
             },
             {
                 "name": "Health Guidance",
+                "image":"https://tse3.mm.bing.net/th/id/OIP.RQ2-RI8faNi0dBMRNB0HoAHaD3?r=0&rs=1&pid=ImgDetMain&o=7&rm=3",
                 "description": "Receive daily wellness tips.",
                 "details": ["Offers diet and exercise recommendations."]
             }
