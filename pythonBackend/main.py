@@ -9,13 +9,13 @@ import pandas as pd
 import sqlite3
 from pydantic import BaseModel
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 import google.generativeai as genai
 import jwt
 from passlib.context import CryptContext
 from dotenv import load_dotenv
 import logging
-
+import re  # Added for robust JSON extraction
 
 load_dotenv()
 
@@ -157,9 +157,18 @@ def askGemini(prompt: str, geminiChat):
     try:
         response = geminiChat.send_message(prompt)
         raw_text = response.text.strip()
-        clean_text = raw_text.replace("```json", "").replace("```", "").strip()
+        
+        # Regex to find JSON object structure { ... }
+        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if match:
+            clean_text = match.group(0)
+        else:
+            clean_text = raw_text.replace("```json", "").replace("```", "").strip()
+            
         if not clean_text:
-            raise ValueError("Empty response from Gemini")
+            # Return valid empty structure if extraction fails
+            return '{"symptoms": [], "age": null, "gender": null, "previous_conditions": []}'
+            
         return clean_text
     except Exception as e:
         logger.error(f"Gemini API error: {str(e)}")
@@ -184,7 +193,6 @@ def generate_conversation_name(conversation_id: str, user_id: str) -> str:
     try:
         conn = sqlite3.connect("ayurvaid.db")
         cursor = conn.cursor()
-        # Get the first user message
         cursor.execute(
             """
             SELECT message
@@ -198,11 +206,9 @@ def generate_conversation_name(conversation_id: str, user_id: str) -> str:
         result = cursor.fetchone()
         if result:
             message = result[0]
-            # Use first 30 characters of the message, trimmed
             name = (message[:30] + "...") if len(message) > 30 else message
             return name.strip()
         
-        # Fallback: Check pending_chats for symptoms
         cursor.execute(
             """
             SELECT symptoms
@@ -217,9 +223,8 @@ def generate_conversation_name(conversation_id: str, user_id: str) -> str:
         if result and result[0]:
             symptoms = json.loads(result[0])
             if symptoms:
-                return ", ".join(symptoms[:2])  # Use first two symptoms
-        # Final fallback: Use conversation_id
-        return f"Conversation {conversation_id[-6:]}"  # Last 6 digits for brevity
+                return ", ".join(symptoms[:2])
+        return f"Conversation {conversation_id[-6:]}"
     except sqlite3.Error as e:
         logger.error(f"Database error in generate_conversation_name: {str(e)}")
         return f"Conversation {conversation_id[-6:]}"
@@ -263,9 +268,14 @@ def save_pending_chat(user_id: str, conversation_id: str, symptoms: list, age: s
         conn = sqlite3.connect("ayurvaid.db")
         cursor = conn.cursor()
         cursor.execute("DELETE FROM pending_chats WHERE user_id = ? AND conversation_id = ?", (user_id, conversation_id))
+        
+        # Helper to safely dump JSON (dumps None as 'null')
+        def safe_json(val):
+            return json.dumps(val) if val is not None else None
+
         cursor.execute(
             "INSERT INTO pending_chats (user_id, conversation_id, symptoms, age, gender, previous_conditions) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, conversation_id, json.dumps(symptoms), age, gender, json.dumps(previous_conditions))
+            (user_id, conversation_id, safe_json(symptoms), age, gender, safe_json(previous_conditions))
         )
         conn.commit()
     except sqlite3.Error as e:
@@ -285,12 +295,14 @@ def get_current_pending_chat(user_id: str, conversation_id: str):
         result = cursor.fetchone()
         if result:
             return {
-                "symptoms": json.loads(result[0]) if result[0] else [],
+                "symptoms": json.loads(result[0]) if result[0] else None,
                 "age": result[1],
                 "gender": result[2],
-                "previous_conditions": json.loads(result[3]) if result[3] else []
+                # Crucial Fix: Return None if DB has null, return [] if DB has "[]"
+                "previous_conditions": json.loads(result[3]) if result[3] else None
             }
-        return {"symptoms": [], "age": None, "gender": None, "previous_conditions": []}
+        # Explicit None defaults
+        return {"symptoms": None, "age": None, "gender": None, "previous_conditions": None}
     except sqlite3.Error as e:
         logger.error(f"Database error in get_current_pending_chat: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to retrieve pending chat")
@@ -443,7 +455,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
     finally:
         conn.close()
 
-# Updated predict endpoint
+# Updated predict endpoint with fix for NONE loop
 @app.post("/predict")
 async def predict(data: InputData, current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
@@ -451,10 +463,9 @@ async def predict(data: InputData, current_user: dict = Depends(get_current_user
 
     # Validate or generate conversation_id
     if not conversation_id:
-        conversation_id = datetime.now().strftime("%Y%m%d%H%M%S%f")  # More unique ID
+        conversation_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
         logger.info(f"Generated new conversation_id: {conversation_id} for user_id: {user_id}")
     else:
-        # Check if conversation_id exists for this user
         try:
             conn = sqlite3.connect("ayurvaid.db")
             cursor = conn.cursor()
@@ -487,7 +498,7 @@ async def predict(data: InputData, current_user: dict = Depends(get_current_user
         logger.error(f"Error setting up Gemini in predict: {str(e)}")
         return {"error": f"Error setting up AI model: {str(e)}", "conversation_id": conversation_id}
 
-    # Fetch chat history
+    # Fetch chat history for context
     try:
         conn = sqlite3.connect("ayurvaid.db")
         cursor = conn.cursor()
@@ -519,63 +530,104 @@ async def predict(data: InputData, current_user: dict = Depends(get_current_user
     finally:
         conn.close()
 
-    # Process intent and response
-    try:
-        intent = askGemini(context_prompt, geminiIntentChat).strip().lower()
-        if intent == "general":
+    # --- UPDATED LOGIC START ---
+    
+    # ADDED THE MISSING TRY HERE
+    try: 
+        # 1. Check if we are already in the middle of a medical intake
+        current_pending = get_current_pending_chat(user_id, conversation_id)
+        is_mid_conversation = (current_pending["symptoms"] is not None)
+
+        # 2. Determine Intent (Force 'medical' if mid-conversation to avoid drift)
+        if is_mid_conversation:
+            intent = "medical"
+        else:
+            intent = askGemini(context_prompt, geminiIntentChat).strip().lower()
+
+        if intent == "general" and not is_mid_conversation:
             finalResponse = askGemini(context_prompt, geminiConversationalChat)
         else:
+            # Medical Logic
             raw_response = askGemini(context_prompt, geminiDiseaseChat)
             try:
                 parsed_data = json.loads(raw_response)
                 new_symptoms = parsed_data.get("symptoms", [])
                 new_age = parsed_data.get("age")
                 new_gender = parsed_data.get("gender")
-                new_previous_conditions = parsed_data.get("previous_conditions", [])
+                new_previous_conditions = parsed_data.get("previous_conditions") 
             except json.JSONDecodeError:
                 new_symptoms = []
                 new_age = None
                 new_gender = None
-                new_previous_conditions = []
+                new_previous_conditions = None
 
-            current_pending = get_current_pending_chat(user_id, conversation_id)
-            symptoms = list(set(current_pending["symptoms"] + new_symptoms)) if new_symptoms else current_pending["symptoms"]
+            # Merge with existing pending data
+            symptoms = list(set((current_pending["symptoms"] or []) + new_symptoms)) if new_symptoms else (current_pending["symptoms"] or [])
             age = new_age if new_age is not None else current_pending["age"]
             gender = new_gender if new_gender is not None else current_pending["gender"]
-            previous_conditions = list(set(current_pending["previous_conditions"] + new_previous_conditions)) if new_previous_conditions else current_pending["previous_conditions"]
+            
+            # Handle Previous Conditions Logic
+            previous_conditions = current_pending["previous_conditions"] # Start with DB state
+            
+            # Update from LLM if LLM found something
+            if new_previous_conditions is not None:
+                if previous_conditions is None:
+                    previous_conditions = new_previous_conditions
+                else:
+                    previous_conditions = list(set(previous_conditions + new_previous_conditions))
 
-            # Handle "no previous health condition" or "none" in user input
+            # EXPLICIT OVERRIDE: Check for "None" keywords in user input
             user_input_lower = data.user_input.lower()
-            if "no previous health condition" in user_input_lower or "none" in user_input_lower:
-                previous_conditions = []
+            explicit_none_keywords = ["no previous", "none", "healthy", "no condition", "nothing", "no health"]
+            
+            if any(keyword in user_input_lower for keyword in explicit_none_keywords):
+                previous_conditions = [] # Set to confirmed empty list
 
+            # Check for missing fields
             missing = []
-            if not symptoms:
-                missing.append("symptoms")
-            if age is None:
-                missing.append("age")
-            if gender is None:
-                missing.append("gender")
-            # Only ask for previous conditions if not explicitly set to none
-            if not previous_conditions and "previous health conditions" not in user_input_lower and "none" not in user_input_lower:
+            if not symptoms and symptoms != []: missing.append("symptoms")
+            if age is None: missing.append("age")
+            if gender is None: missing.append("gender")
+            
+            # The Fix: Only ask if it is explicitly None (unknown). Empty list [] means "No conditions" (Known)
+            if previous_conditions is None:
                 missing.append("previous health conditions")
 
             if missing:
+                # Save state (Handle None vs [])
+                save_symptoms = symptoms if symptoms else []
+                save_conditions = previous_conditions 
+                
+                save_pending_chat(user_id, conversation_id, save_symptoms, age, gender, save_conditions)
                 finalResponse = f"Please provide your {', '.join(missing)}."
             else:
+                # All data present
+                final_conditions = previous_conditions if previous_conditions else []
+                
                 binary_vector = convertUserResponseToDatasetStructure(symptoms, symptom_master_list)
+                
                 if sum(binary_vector) == 0:
-                    finalResponse = "I couldn’t match those symptoms. Please describe them differently."
+                    finalResponse = "I couldn’t match those symptoms to my database. Please describe them differently."
                 else:
                     diseasesPredicted = predict_disease(binary_vector)
-                    adjustment_prompt = f"Disease: {diseasesPredicted}, Symptoms: {', '.join(symptoms)}, Age: {age}, Gender: {gender}, Previous Conditions: {', '.join(previous_conditions)}"
+                    
+                    adjustment_prompt = (
+                        f"Disease: {diseasesPredicted}, "
+                        f"Symptoms: {', '.join(symptoms)}, "
+                        f"Age: {age}, "
+                        f"Gender: {gender}, "
+                        f"Previous Conditions: {', '.join(final_conditions)}"
+                    )
+                    
                     raw_adjust_response = askGemini(adjustment_prompt, geminiAdjustmentChat)
                     try:
                         adjustments = json.loads(raw_adjust_response)
                     except json.JSONDecodeError:
                         adjustments = {"disease_adjustment": "None", "medicine_adjustment": "None"}
+                    
                     ayurvedicRog = classifyDisease(diseasesPredicted, symptoms, geminiAryuvedicChat).strip()
                     listOfAyurvedicMedication = getKeyValuesfromMedicineJson(aryuvedicMedicineData, ayurvedicRog)
+                    
                     if not isinstance(listOfAyurvedicMedication, list):
                         listOfAyurvedicMedication = listCleaner(listOfAyurvedicMedication)
 
@@ -584,19 +636,21 @@ async def predict(data: InputData, current_user: dict = Depends(get_current_user
                         f"Symptoms: {', '.join(symptoms)}\n"
                         f"Age: {age}\n"
                         f"Gender: {gender}\n"
-                        f"Previous Health Conditions: {', '.join(previous_conditions)}\n"
+                        f"Previous Health Conditions: {', '.join(final_conditions)}\n"
                         f"Disease Adjustment: {adjustments.get('disease_adjustment', 'None')}\n"
                         f"Medicine Adjustment: {adjustments.get('medicine_adjustment', 'None')}\n"
                         f"Aurvedic Disease Name: {ayurvedicRog}\n"
                         f"Aurvedic Medications List: {listOfAyurvedicMedication}"
                     )
+                    
                     finalResponse = askGemini(userMedicalData, geminiFinalResponseChat)
                     delete_pending_chat(user_id, conversation_id)
+
+    # --- UPDATED LOGIC END ---
 
     except Exception as e:
         logger.error(f"Error processing AI response: {str(e)}")
         finalResponse = "Sorry, something went wrong. Please try again."
-        conversation_id = conversation_id  # Ensure conversation_id is returned
 
     # Save bot response
     try:
@@ -613,9 +667,7 @@ async def predict(data: InputData, current_user: dict = Depends(get_current_user
     finally:
         conn.close()
 
-    return {"response": finalResponse, "conversation_id": conversation_id}
-
-# Updated chats endpoint
+    return {"response": finalResponse, "conversation_id": conversation_id}# Updated chats endpoint
 @app.get("/chats")
 async def get_chat_history(
     current_user: dict = Depends(get_current_user),
@@ -641,7 +693,6 @@ async def get_chat_history(
             }
             for chat in chats
         ]
-        # Include conversation name if specific conversation_id is requested
         conversation_name = None
         if conversation_id:
             conversation_name = generate_conversation_name(conversation_id, current_user["id"])
